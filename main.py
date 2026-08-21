@@ -21,7 +21,7 @@ from typing import Any
 
 import httpx
 
-from config import BATCH_SIZE, HF_RATE_LIMIT_DELAY, REQUEST_DELAY, SOURCE
+from config import BATCH_SIZE, REQUEST_DELAY, SOURCE
 from embeddings import embed_products
 from scraper import CATEGORIES, scrape_all_categories
 from supabase_client import SupabaseClient
@@ -128,7 +128,7 @@ async def run_scraper(dry_run: bool = False, category_filter: str | None = None)
     logger.info("STEP 3: Generating embeddings")
     logger.info("=" * 40)
 
-    all_products, embed_stats = await embed_products(all_products, existing_map)
+    all_products, embed_stats = embed_products(all_products, existing_map)
     stats["front_embeddings"] = embed_stats["front_embeddings"]
     stats["back_embeddings"] = embed_stats["back_embeddings"]
     stats["text_embeddings"] = embed_stats["text_embeddings"]
