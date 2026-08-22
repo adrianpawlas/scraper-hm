@@ -175,7 +175,8 @@ def embed_products(
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Generate embeddings for products using local SigLIP model.
 
-    Uses concurrent image downloads for speed.
+    Processes in batches: downloads ~200 images at a time, embeds them,
+    then downloads the next batch. Keeps memory usage low.
     """
     if existing_embeddings is None:
         existing_embeddings = {}
@@ -189,8 +190,10 @@ def embed_products(
 
     _load_model()
 
-    # Phase 1: Determine which images need downloading
-    to_download = []  # (index, url, type) where type is 'front' or 'back'
+    BATCH_DOWNLOAD = 200  # download this many images at a time
+
+    # Build a list of (product_index, url, type) for all images that need embedding
+    all_needed = []
     for i, product in enumerate(products):
         product_url = product.get("product_url", "")
         existing = existing_embeddings.get(product_url, {})
@@ -198,57 +201,91 @@ def embed_products(
         image_url = product.get("image_url", "")
         existing_image_url = existing.get("image_url", "")
         if image_url and (not existing or image_url != existing_image_url):
-            to_download.append((i, image_url, "front"))
+            all_needed.append((i, image_url, "front"))
 
         back_url = product.get("back_image_url")
         existing_back_url = existing.get("back_image_url")
         if back_url and (not existing or back_url != existing_back_url):
-            to_download.append((i, back_url, "back"))
+            all_needed.append((i, back_url, "back"))
 
-    # Phase 2: Download all needed images concurrently
-    if to_download:
-        download_urls = list(set(url for _, url, _ in to_download))
-        logger.info("Downloading %d images with %d workers...", len(download_urls), DOWNLOAD_WORKERS)
-        downloaded = _download_batch(download_urls)
-        logger.info("Downloaded %d/%d images", sum(1 for v in downloaded.values() if v is not None), len(download_urls))
-    else:
-        downloaded = {}
+    # Process in download batches
+    downloaded_urls: set[str] = set()
+    downloaded_images: dict[str, Image.Image] = {}
 
-    # Phase 3: Process embeddings sequentially (model inference is CPU/GPU bound)
+    for batch_start in range(0, len(all_needed), BATCH_DOWNLOAD):
+        batch = all_needed[batch_start : batch_start + BATCH_DOWNLOAD]
+        batch_urls = list(set(url for _, url, _ in batch if url not in downloaded_urls))
+
+        if batch_urls:
+            logger.info(
+                "  Downloading batch %d-%d (%d images)...",
+                batch_start + 1,
+                min(batch_start + BATCH_DOWNLOAD, len(all_needed)),
+                len(batch_urls),
+            )
+            batch_images = _download_batch(batch_urls)
+            downloaded_images.update(batch_images)
+            downloaded_urls.update(batch_urls)
+            succeeded = sum(1 for v in batch_images.values() if v is not None)
+            logger.info("  Downloaded %d/%d", succeeded, len(batch_urls))
+
+        # Process embeddings for this batch
+        for idx, url, view_type in batch:
+            product = products[idx]
+            product_url = product.get("product_url", "")
+            existing = existing_embeddings.get(product_url, {})
+
+            if view_type == "front":
+                image_url = product.get("image_url", "")
+                existing_image_url = existing.get("image_url", "")
+                if image_url and (not existing or image_url != existing_image_url):
+                    image = downloaded_images.get(image_url)
+                    if image:
+                        embedding = _embed_image(image)
+                        if embedding:
+                            product["image_embedding"] = embedding
+                            product["embedding_version"] = 2
+                            stats["front_embeddings"] += 1
+                        else:
+                            stats["skipped"] += 1
+                else:
+                    if existing and existing.get("image_embedding"):
+                        product["image_embedding"] = existing["image_embedding"]
+
+            elif view_type == "back":
+                back_url = product.get("back_image_url")
+                existing_back_url = existing.get("back_image_url")
+                if back_url and (not existing or back_url != existing_back_url):
+                    image = downloaded_images.get(back_url)
+                    if image:
+                        back_embedding = _embed_image(image)
+                        if back_embedding:
+                            product["back_image_embedding"] = back_embedding
+                            stats["back_embeddings"] += 1
+                elif not back_url:
+                    product["back_image_embedding"] = None
+
+        # Free memory from this batch's images
+        for url in batch_urls:
+            downloaded_images.pop(url, None)
+
+    # Process text embeddings for all products (fast, no images needed)
     for i, product in enumerate(products):
         product_url = product.get("product_url", "")
         existing = existing_embeddings.get(product_url, {})
 
+        # Handle products that didn't need image re-embedding
         image_url = product.get("image_url", "")
         existing_image_url = existing.get("image_url", "")
-
-        # Front embedding
-        if image_url and (not existing or image_url != existing_image_url):
-            image = downloaded.get(image_url)
-            if image:
-                embedding = _embed_image(image)
-                if embedding:
-                    product["image_embedding"] = embedding
-                    product["embedding_version"] = 2
-                    stats["front_embeddings"] += 1
-                else:
-                    stats["skipped"] += 1
-        else:
+        if not (image_url and (not existing or image_url != existing_image_url)):
             if existing and existing.get("image_embedding"):
                 product["image_embedding"] = existing["image_embedding"]
 
-        # Back embedding
         back_url = product.get("back_image_url")
         existing_back_url = existing.get("back_image_url")
-        if back_url and (not existing or back_url != existing_back_url):
-            image = downloaded.get(back_url)
-            if image:
-                back_embedding = _embed_image(image)
-                if back_embedding:
-                    product["back_image_embedding"] = back_embedding
-                    stats["back_embeddings"] += 1
-        elif not back_url:
-            product["back_image_embedding"] = None
+        if not back_url and not (not existing or back_url != existing_back_url):
+            if existing and existing.get("back_image_embedding"):
+                product["back_image_embedding"] = existing["back_image_embedding"]
 
         # Info embedding
         info_text = _build_info_text(product)
@@ -265,7 +302,7 @@ def embed_products(
             if existing and existing.get("info_embedding"):
                 product["info_embedding"] = existing["info_embedding"]
 
-        if (i + 1) % 50 == 0:
+        if (i + 1) % 100 == 0:
             logger.info(
                 "  Embedding progress: %d/%d (front=%d, text=%d)",
                 i + 1,
