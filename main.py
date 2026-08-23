@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import pickle
 import sys
 import time
 from datetime import datetime, timezone
@@ -55,6 +56,41 @@ def _print_summary(stats: dict[str, Any], duration: float):
     print("=" * 60)
 
 
+CACHE_DIR = "logs"
+PRODUCT_CACHE_MAX_AGE = 86400  # 24 hours in seconds
+
+
+def _product_cache_path(source: str, category_filter: str | None = None) -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    suffix = f"_{category_filter}" if category_filter else ""
+    return os.path.join(CACHE_DIR, f"products_{source}{suffix}.pkl")
+
+
+def _load_product_cache(source: str, category_filter: str | None = None) -> list[dict[str, Any]] | None:
+    path = _product_cache_path(source, category_filter)
+    if not os.path.exists(path):
+        return None
+    age = time.time() - os.path.getmtime(path)
+    if age > PRODUCT_CACHE_MAX_AGE:
+        logger.info("Product cache expired (%.0f min old), re-scraping", age / 60)
+        return None
+    try:
+        with open(path, "rb") as f:
+            products = pickle.load(f)
+        logger.info("Loaded %d products from cache (%.0f min old)", len(products), age / 60)
+        return products
+    except Exception as e:
+        logger.warning("Failed to load product cache: %s", e)
+        return None
+
+
+def _save_product_cache(products: list[dict[str, Any]], source: str, category_filter: str | None = None):
+    path = _product_cache_path(source, category_filter)
+    with open(path, "wb") as f:
+        pickle.dump(products, f, protocol=pickle.HIGHEST_PROTOCOL)
+    logger.info("Cached %d products to %s", len(products), path)
+
+
 async def run_scraper(dry_run: bool = False, category_filter: str | None = None):
     """Main scraper execution."""
     start_time = time.time()
@@ -75,25 +111,31 @@ async def run_scraper(dry_run: bool = False, category_filter: str | None = None)
     logger.info(f"Source: {SOURCE}")
     logger.info(f"Dry run: {dry_run}")
 
-    # Step 1: Scrape all categories
+    # Step 1: Scrape all categories (or load from cache)
     logger.info("=" * 40)
     logger.info("STEP 1: Scraping H&M product listings")
     logger.info("=" * 40)
 
-    if category_filter:
-        from scraper import CATEGORIES as ALL_CATS
-        filtered = [c for c in ALL_CATS if category_filter.lower() in c["category_name"].lower()]
-        if not filtered:
-            logger.error(f"No categories match filter: {category_filter}")
-            return
-        logger.info(f"Filtering to categories: {[c['category_name'] for c in filtered]}")
-        all_products = await scrape_all_categories(filtered)
-    else:
-        all_products = await scrape_all_categories()
+    # Try loading from cache first
+    all_products = _load_product_cache(SOURCE, category_filter)
 
-    if not all_products:
-        logger.error("No products scraped!")
-        return
+    if all_products is None:
+        if category_filter:
+            from scraper import CATEGORIES as ALL_CATS
+            filtered = [c for c in ALL_CATS if category_filter.lower() in c["category_name"].lower()]
+            if not filtered:
+                logger.error(f"No categories match filter: {category_filter}")
+                return
+            logger.info(f"Filtering to categories: {[c['category_name'] for c in filtered]}")
+            all_products = await scrape_all_categories(filtered)
+        else:
+            all_products = await scrape_all_categories()
+
+        if not all_products:
+            logger.error("No products scraped!")
+            return
+
+        _save_product_cache(all_products, SOURCE, category_filter)
 
     logger.info(f"Total unique products scraped: {len(all_products)}")
 
@@ -189,7 +231,14 @@ def main():
     parser = argparse.ArgumentParser(description="H&M Product Scraper")
     parser.add_argument("--dry-run", action="store_true", help="Scrape without DB writes")
     parser.add_argument("--category", type=str, help="Filter to specific category")
+    parser.add_argument("--fresh", action="store_true", help="Ignore product cache, re-scrape")
     args = parser.parse_args()
+
+    if args.fresh:
+        cache_path = _product_cache_path(SOURCE, args.category)
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+            logger.info("Removed product cache: %s", cache_path)
 
     asyncio.run(run_scraper(dry_run=args.dry_run, category_filter=args.category))
 
