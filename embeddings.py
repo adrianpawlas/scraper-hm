@@ -48,10 +48,10 @@ def _get_device():
 def _load_model():
     global _model, _image_processor, _tokenizer
     if _model is None:
-        logger.info("Loading SigLIP model %s (float16)...", MODEL_NAME)
+        logger.info("Loading SigLIP model %s...", MODEL_NAME)
         _image_processor = SiglipImageProcessor.from_pretrained(MODEL_NAME)
         _tokenizer = SiglipTokenizer.from_pretrained(MODEL_NAME)
-        _model = SiglipModel.from_pretrained(MODEL_NAME, dtype=torch.float16)
+        _model = SiglipModel.from_pretrained(MODEL_NAME)
         _model.to(_get_device())
         _model.eval()
     return _model, _image_processor, _tokenizer
