@@ -1,13 +1,17 @@
 """Image and text embeddings using SigLIP (768-dim).
 
-Optimized with ONNX Runtime for fast CPU inference,
-pipelined downloads, and checkpoint/resume support.
+Optimized with pipelined downloads, checkpoint/resume support,
+and graceful SIGTERM handling.
 """
+import gc
 import io
 import json
 import logging
 import math
 import os
+import pickle
+import signal
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
@@ -28,9 +32,10 @@ logging.getLogger("transformers.configuration_utils").setLevel(logging.ERROR)
 
 MODEL_NAME = "google/siglip-base-patch16-384"
 EMBEDDING_DIM = 768
-DOWNLOAD_WORKERS = 20
+DOWNLOAD_WORKERS = 10
 INFERENCE_BATCH_SIZE = 64
 CHECKPOINT_DIR = "logs"
+BATCH_DOWNLOAD = 200
 
 _model = None
 _image_processor = None
@@ -199,19 +204,35 @@ def _download_batch(urls: list[str]) -> dict[str, Optional[Image.Image]]:
 
 # ── Checkpoint helpers ──────────────────────────────────────────────
 
+_checkpoint_source: str = ""
+_checkpoint_data: dict[str, dict[str, Any]] = {}
+
+
 def _checkpoint_path(source: str) -> str:
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    return os.path.join(CHECKPOINT_DIR, f"embed_checkpoint_{source}.json")
+    return os.path.join(CHECKPOINT_DIR, f"embed_checkpoint_{source}.pkl")
 
 
 def load_checkpoint(source: str) -> dict[str, dict[str, Any]]:
     """Load previously-embedded product data from checkpoint file."""
     path = _checkpoint_path(source)
     if not os.path.exists(path):
+        # Try legacy JSON checkpoint
+        json_path = os.path.join(CHECKPOINT_DIR, f"embed_checkpoint_{source}.json")
+        if os.path.exists(json_path):
+            try:
+                with open(json_path) as f:
+                    data = json.load(f)
+                logger.info("Migrated legacy JSON checkpoint: %d products", len(data))
+                _save_checkpoint(source, data)
+                os.remove(json_path)
+                return data
+            except Exception as e:
+                logger.warning("Failed to load legacy checkpoint: %s", e)
         return {}
     try:
-        with open(path) as f:
-            data = json.load(f)
+        with open(path, "rb") as f:
+            data = pickle.load(f)
         logger.info("Loaded checkpoint: %d products already embedded", len(data))
         return data
     except Exception as e:
@@ -222,8 +243,8 @@ def load_checkpoint(source: str) -> dict[str, dict[str, Any]]:
 def _save_checkpoint(source: str, data: dict[str, dict[str, Any]]):
     path = _checkpoint_path(source)
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f)
+    with open(tmp, "wb") as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, path)
 
 
@@ -233,6 +254,40 @@ def clear_checkpoint(source: str):
     if os.path.exists(path):
         os.remove(path)
         logger.info("Cleared embedding checkpoint")
+
+
+def _log_memory(label: str):
+    """Log current memory usage."""
+    try:
+        import resource
+        raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux: ru_maxrss is in KB; macOS: bytes
+        if raw > 1_000_000:
+            mb = raw / (1024 * 1024)
+        else:
+            mb = raw / 1024
+        logger.info("  [MEM %s] RSS: %.0f MB", label, mb)
+    except Exception:
+        pass
+
+
+def _setup_signal_handlers(source: str):
+    """Install SIGTERM handler to save checkpoint before exit."""
+    global _checkpoint_source, _checkpoint_data
+    _checkpoint_source = source
+
+    def handler(signum, frame):
+        logger.warning("Received signal %d, saving checkpoint before exit...", signum)
+        if _checkpoint_data:
+            try:
+                _save_checkpoint(_checkpoint_source, _checkpoint_data)
+                logger.warning("Checkpoint saved (%d products)", len(_checkpoint_data))
+            except Exception as e:
+                logger.error("Failed to save checkpoint: %s", e)
+        sys.exit(143)
+
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
 
 
 # ── Main embedding pipeline ────────────────────────────────────────
@@ -264,8 +319,8 @@ def embed_products(
             existing_embeddings[url] = ckpt_data
 
     _load_model()
-
-    BATCH_DOWNLOAD = 400
+    _log_memory("after model load")
+    _setup_signal_handlers(source)
 
     # Build list of images needing embedding
     all_needed: list[tuple[int, str, str]] = []
@@ -284,6 +339,7 @@ def embed_products(
             all_needed.append((i, back_url, "back"))
 
     logger.info("Need to embed %d images total", len(all_needed))
+    _log_memory("before embedding loop")
 
     # Also carry forward existing image/text embeddings for products not needing re-embed
     for i, product in enumerate(products):
@@ -299,8 +355,12 @@ def embed_products(
             if existing.get("embedding_version"):
                 product["embedding_version"] = existing["embedding_version"]
 
-    # Track embedded URLs for checkpointing
+    # Track embedded URLs for checkpointing (lightweight in-memory set)
+    global _checkpoint_data
     checkpoint_data: dict[str, dict[str, Any]] = dict(checkpoint)
+    _checkpoint_data = checkpoint_data
+    # Also track just URLs to avoid keeping all embeddings in memory
+    completed_urls: set[str] = set(checkpoint.keys())
 
     if not all_needed:
         logger.info("All images already embedded (from checkpoint/existing), skipping image embedding")
@@ -401,19 +461,28 @@ def embed_products(
 
             downloaded_urls.update(url for _, url, _ in batch)
             pending_download.clear()
+            gc.collect()
 
-            # Save checkpoint after each batch
+            # Save checkpoint to disk, then clear in-memory data to save RAM
             _save_checkpoint(source, checkpoint_data)
+            completed_urls.update(checkpoint_data.keys())
+            checkpoint_data.clear()
 
+            _log_memory("batch %d/%d" % (batch_num, total_batches))
             logger.info(
-                "  Batch %d/%d done. front=%d, back=%d (checkpoint saved)",
+                "  Batch %d/%d done. front=%d, back=%d (checkpoint saved, %d URLs tracked)",
                 batch_num,
                 total_batches,
                 stats["front_embeddings"],
                 stats["back_embeddings"],
+                len(completed_urls),
             )
 
         download_executor.shutdown(wait=False)
+
+    # Reload checkpoint from disk (contains all image embeddings we just saved)
+    checkpoint_data = load_checkpoint(source)
+    _checkpoint_data = checkpoint_data
 
     # Text embeddings
     logger.info("  Generating text embeddings for %d products...", len(products))
@@ -457,5 +526,6 @@ def embed_products(
 
     # Final checkpoint save
     _save_checkpoint(source, checkpoint_data)
+    _checkpoint_data.clear()
 
     return products, stats
