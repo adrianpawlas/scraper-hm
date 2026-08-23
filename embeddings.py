@@ -180,6 +180,8 @@ def _build_info_text(product: dict[str, Any]) -> str:
 
 def _download_batch(urls: list[str]) -> dict[str, Optional[Image.Image]]:
     results: dict[str, Optional[Image.Image]] = {}
+    completed = 0
+    total = len(urls)
     with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
         future_to_url = {executor.submit(_download_image, url): url for url in urls}
         for future in as_completed(future_to_url):
@@ -189,6 +191,9 @@ def _download_batch(urls: list[str]) -> dict[str, Optional[Image.Image]]:
             except Exception as e:
                 logger.warning("Download failed for %s: %s", url, e)
                 results[url] = None
+            completed += 1
+            if completed % 50 == 0:
+                logger.info("    Download progress: %d/%d", completed, total)
     return results
 
 
