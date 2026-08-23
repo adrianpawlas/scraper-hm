@@ -23,6 +23,9 @@ from transformers import SiglipModel, SiglipTokenizer
 
 logger = logging.getLogger(__name__)
 
+# Suppress SigLIP config warnings (bos_token_id/eos_token_id out of vocab range)
+logging.getLogger("transformers.configuration_utils").setLevel(logging.ERROR)
+
 MODEL_NAME = "google/siglip-base-patch16-384"
 EMBEDDING_DIM = 768
 DOWNLOAD_WORKERS = 20
