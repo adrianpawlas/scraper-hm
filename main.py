@@ -22,7 +22,7 @@ from typing import Any
 import httpx
 
 from config import BATCH_SIZE, REQUEST_DELAY, SOURCE
-from embeddings import embed_products
+from embeddings import embed_products, clear_checkpoint
 from scraper import CATEGORIES, scrape_all_categories
 from supabase_client import SupabaseClient
 
@@ -128,7 +128,7 @@ async def run_scraper(dry_run: bool = False, category_filter: str | None = None)
     logger.info("STEP 3: Generating embeddings")
     logger.info("=" * 40)
 
-    all_products, embed_stats = embed_products(all_products, existing_map)
+    all_products, embed_stats = embed_products(all_products, existing_map, source=SOURCE)
     stats["front_embeddings"] = embed_stats["front_embeddings"]
     stats["back_embeddings"] = embed_stats["back_embeddings"]
     stats["text_embeddings"] = embed_stats["text_embeddings"]
@@ -159,6 +159,9 @@ async def run_scraper(dry_run: bool = False, category_filter: str | None = None)
             logger.info("STEP 5: Cleaning up stale products")
             logger.info("=" * 40)
             stats["stale_deleted"] = await sb.cleanup_stale_products(client, seen_urls)
+
+            # Clear checkpoint after successful DB upsert
+            clear_checkpoint(SOURCE)
     else:
         logger.info("DRY RUN - Skipping DB upsert and cleanup")
         # Count what would happen

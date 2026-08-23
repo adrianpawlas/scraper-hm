@@ -1,6 +1,7 @@
 """Image and text embeddings using SigLIP (768-dim).
 
-Optimized with pipelined downloads, batched inference, and thread control.
+Optimized with ONNX Runtime for fast CPU inference,
+pipelined downloads, and checkpoint/resume support.
 """
 import io
 import json
@@ -26,6 +27,7 @@ MODEL_NAME = "google/siglip-base-patch16-384"
 EMBEDDING_DIM = 768
 DOWNLOAD_WORKERS = 20
 INFERENCE_BATCH_SIZE = 64
+CHECKPOINT_DIR = "logs"
 
 _model = None
 _image_processor = None
@@ -74,7 +76,6 @@ def _download_image(image_url: str) -> Optional[Image.Image]:
 
 
 def _embed_images_batch(images: list[Image.Image]) -> list[Optional[list[float]]]:
-    """Embed a batch of images through SigLIP vision encoder."""
     model, image_processor, _ = _load_model()
     device = _get_device()
     results: list[Optional[list[float]]] = [None] * len(images)
@@ -188,13 +189,55 @@ def _download_batch(urls: list[str]) -> dict[str, Optional[Image.Image]]:
     return results
 
 
+# ── Checkpoint helpers ──────────────────────────────────────────────
+
+def _checkpoint_path(source: str) -> str:
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    return os.path.join(CHECKPOINT_DIR, f"embed_checkpoint_{source}.json")
+
+
+def load_checkpoint(source: str) -> dict[str, dict[str, Any]]:
+    """Load previously-embedded product data from checkpoint file."""
+    path = _checkpoint_path(source)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        logger.info("Loaded checkpoint: %d products already embedded", len(data))
+        return data
+    except Exception as e:
+        logger.warning("Failed to load checkpoint: %s", e)
+        return {}
+
+
+def _save_checkpoint(source: str, data: dict[str, dict[str, Any]]):
+    path = _checkpoint_path(source)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def clear_checkpoint(source: str):
+    """Delete checkpoint file after successful DB upsert."""
+    path = _checkpoint_path(source)
+    if os.path.exists(path):
+        os.remove(path)
+        logger.info("Cleared embedding checkpoint")
+
+
+# ── Main embedding pipeline ────────────────────────────────────────
+
 def embed_products(
     products: list[dict[str, Any]],
     existing_embeddings: dict[str, dict[str, Any]] | None = None,
+    source: str = "scraper-hm",
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Generate embeddings with pipelined downloads and batched inference.
+    """Generate embeddings with pipelined downloads and checkpoint/resume.
 
-    Pipeline: download batch N+1 while embedding batch N.
+    Loads checkpoint from previous run to skip already-embedded products.
+    Saves checkpoint after each batch so progress survives kills/restarts.
     """
     if existing_embeddings is None:
         existing_embeddings = {}
@@ -206,11 +249,17 @@ def embed_products(
         "skipped": 0,
     }
 
+    # Merge checkpoint into existing_embeddings so we skip already-done products
+    checkpoint = load_checkpoint(source)
+    for url, ckpt_data in checkpoint.items():
+        if url not in existing_embeddings:
+            existing_embeddings[url] = ckpt_data
+
     _load_model()
 
     BATCH_DOWNLOAD = 400
 
-    # Build list of (product_index, url, type) for images needing embedding
+    # Build list of images needing embedding
     all_needed: list[tuple[int, str, str]] = []
     for i, product in enumerate(products):
         product_url = product.get("product_url", "")
@@ -228,108 +277,137 @@ def embed_products(
 
     logger.info("Need to embed %d images total", len(all_needed))
 
-    total_batches = math.ceil(len(all_needed) / BATCH_DOWNLOAD) if all_needed else 0
-    downloaded_urls: set[str] = set()
+    # Also carry forward existing image/text embeddings for products not needing re-embed
+    for i, product in enumerate(products):
+        product_url = product.get("product_url", "")
+        existing = existing_embeddings.get(product_url, {})
+        if existing:
+            if existing.get("image_embedding") and not product.get("image_embedding"):
+                product["image_embedding"] = existing["image_embedding"]
+            if existing.get("back_image_embedding") and not product.get("back_image_embedding"):
+                product["back_image_embedding"] = existing["back_image_embedding"]
+            if existing.get("info_embedding") and not product.get("info_embedding"):
+                product["info_embedding"] = existing["info_embedding"]
+            if existing.get("embedding_version"):
+                product["embedding_version"] = existing["embedding_version"]
 
-    # Pre-split all_needed into download batches
-    download_batches: list[list[tuple[int, str, str]]] = []
-    for batch_start in range(0, len(all_needed), BATCH_DOWNLOAD):
-        download_batches.append(all_needed[batch_start : batch_start + BATCH_DOWNLOAD])
+    # Track embedded URLs for checkpointing
+    checkpoint_data: dict[str, dict[str, Any]] = dict(checkpoint)
 
-    # Pipeline: download next batch while embedding current
-    pending_download: dict[str, Optional[Image.Image]] = {}
-    download_executor = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
-    next_download_future = None
+    if not all_needed:
+        logger.info("All images already embedded (from checkpoint/existing), skipping image embedding")
+    else:
+        total_batches = math.ceil(len(all_needed) / BATCH_DOWNLOAD)
+        downloaded_urls: set[str] = set()
 
-    def _start_download(batch: list[tuple[int, str, str]]):
-        urls = list(set(url for _, url, _ in batch if url not in downloaded_urls))
-        if not urls:
-            return None
-        return download_executor.submit(_download_batch, urls)
+        # Pre-split into download batches
+        download_batches: list[list[tuple[int, str, str]]] = []
+        for batch_start in range(0, len(all_needed), BATCH_DOWNLOAD):
+            download_batches.append(all_needed[batch_start : batch_start + BATCH_DOWNLOAD])
 
-    # Start first download
-    if download_batches:
-        next_download_future = _start_download(download_batches[0])
+        # Pipeline: download next batch while embedding current
+        pending_download: dict[str, Optional[Image.Image]] = {}
+        download_executor = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
+        next_download_future = None
 
-    for batch_num, batch in enumerate(download_batches, 1):
-        # Wait for current download to finish
-        if next_download_future is not None:
-            logger.info("  Batch %d/%d: waiting for downloads...", batch_num, total_batches)
-            try:
-                pending_download = next_download_future.result()
-            except Exception as e:
-                logger.error("Download batch failed: %s", e)
-                pending_download = {}
+        def _start_download(batch: list[tuple[int, str, str]]):
+            urls = list(set(url for _, url, _ in batch if url not in downloaded_urls))
+            if not urls:
+                return None
+            return download_executor.submit(_download_batch, urls)
 
-        # Kick off next download in parallel
-        if batch_num < len(download_batches):
-            next_download_future = _start_download(download_batches[batch_num])
-        else:
-            next_download_future = None
+        if download_batches:
+            next_download_future = _start_download(download_batches[0])
 
-        # Process embeddings for current batch
-        images_to_embed: list[tuple[int, str, str, Image.Image]] = []
-        for idx, url, view_type in batch:
-            product = products[idx]
-            product_url = product.get("product_url", "")
-            existing = existing_embeddings.get(product_url, {})
+        for batch_num, batch in enumerate(download_batches, 1):
+            # Wait for current download
+            if next_download_future is not None:
+                logger.info("  Batch %d/%d: waiting for downloads...", batch_num, total_batches)
+                try:
+                    pending_download = next_download_future.result()
+                except Exception as e:
+                    logger.error("Download batch failed: %s", e)
+                    pending_download = {}
 
-            if view_type == "front":
-                image_url = product.get("image_url", "")
-                existing_image_url = existing.get("image_url", "")
-                if image_url and (not existing or image_url != existing_image_url):
-                    image = pending_download.get(image_url)
-                    if image:
-                        images_to_embed.append((idx, image_url, "front", image))
+            # Start next download in parallel
+            if batch_num < len(download_batches):
+                next_download_future = _start_download(download_batches[batch_num])
+            else:
+                next_download_future = None
+
+            # Collect images for batched inference
+            images_to_embed: list[tuple[int, str, str, Image.Image]] = []
+            for idx, url, view_type in batch:
+                product = products[idx]
+                product_url = product.get("product_url", "")
+                existing = existing_embeddings.get(product_url, {})
+
+                if view_type == "front":
+                    image_url = product.get("image_url", "")
+                    existing_image_url = existing.get("image_url", "")
+                    if image_url and (not existing or image_url != existing_image_url):
+                        image = pending_download.get(image_url)
+                        if image:
+                            images_to_embed.append((idx, image_url, "front", image))
+                        else:
+                            stats["skipped"] += 1
+                elif view_type == "back":
+                    back_url = product.get("back_image_url")
+                    existing_back_url = existing.get("back_image_url")
+                    if back_url and (not existing or back_url != existing_back_url):
+                        image = pending_download.get(back_url)
+                        if image:
+                            images_to_embed.append((idx, back_url, "back", image))
+                    elif not back_url:
+                        product["back_image_embedding"] = None
+
+            # Batched inference
+            for infer_start in range(0, len(images_to_embed), INFERENCE_BATCH_SIZE):
+                infer_batch = images_to_embed[infer_start : infer_start + INFERENCE_BATCH_SIZE]
+                pil_images = [img for _, _, _, img in infer_batch]
+                embeddings = _embed_images_batch(pil_images)
+
+                for (idx, url, view_type, _), embedding in zip(infer_batch, embeddings):
+                    product = products[idx]
+                    purl = product.get("product_url", "")
+                    if embedding:
+                        if view_type == "front":
+                            product["image_embedding"] = embedding
+                            product["embedding_version"] = 2
+                            stats["front_embeddings"] += 1
+                        else:
+                            product["back_image_embedding"] = embedding
+                            stats["back_embeddings"] += 1
+                        # Update checkpoint data
+                        if purl not in checkpoint_data:
+                            checkpoint_data[purl] = {}
+                        if view_type == "front":
+                            checkpoint_data[purl]["image_embedding"] = embedding
+                            checkpoint_data[purl]["embedding_version"] = 2
+                            checkpoint_data[purl]["image_url"] = product.get("image_url", "")
+                        else:
+                            checkpoint_data[purl]["back_image_embedding"] = embedding
+                            checkpoint_data[purl]["back_image_url"] = product.get("back_image_url", "")
                     else:
                         stats["skipped"] += 1
-                else:
-                    if existing and existing.get("image_embedding"):
-                        product["image_embedding"] = existing["image_embedding"]
 
-            elif view_type == "back":
-                back_url = product.get("back_image_url")
-                existing_back_url = existing.get("back_image_url")
-                if back_url and (not existing or back_url != existing_back_url):
-                    image = pending_download.get(back_url)
-                    if image:
-                        images_to_embed.append((idx, back_url, "back", image))
-                elif not back_url:
-                    product["back_image_embedding"] = None
+            downloaded_urls.update(url for _, url, _ in batch)
+            pending_download.clear()
 
-        # Batched inference
-        for infer_start in range(0, len(images_to_embed), INFERENCE_BATCH_SIZE):
-            infer_batch = images_to_embed[infer_start : infer_start + INFERENCE_BATCH_SIZE]
-            pil_images = [img for _, _, _, img in infer_batch]
+            # Save checkpoint after each batch
+            _save_checkpoint(source, checkpoint_data)
 
-            embeddings = _embed_images_batch(pil_images)
+            logger.info(
+                "  Batch %d/%d done. front=%d, back=%d (checkpoint saved)",
+                batch_num,
+                total_batches,
+                stats["front_embeddings"],
+                stats["back_embeddings"],
+            )
 
-            for (idx, url, view_type, _), embedding in zip(infer_batch, embeddings):
-                product = products[idx]
-                if embedding:
-                    if view_type == "front":
-                        product["image_embedding"] = embedding
-                        product["embedding_version"] = 2
-                        stats["front_embeddings"] += 1
-                    else:
-                        product["back_image_embedding"] = embedding
-                        stats["back_embeddings"] += 1
-                else:
-                    stats["skipped"] += 1
+        download_executor.shutdown(wait=False)
 
-        downloaded_urls.update(url for _, url, _ in batch)
-        pending_download.clear()
-
-        logger.info(
-            "  Batch %d done. Totals: front=%d, back=%d",
-            batch_num,
-            stats["front_embeddings"],
-            stats["back_embeddings"],
-        )
-
-    download_executor.shutdown(wait=False)
-
-    # Text embeddings for all products
+    # Text embeddings
     logger.info("  Generating text embeddings for %d products...", len(products))
     for i, product in enumerate(products):
         product_url = product.get("product_url", "")
@@ -357,15 +435,19 @@ def embed_products(
             if text_emb:
                 product["info_embedding"] = text_emb
                 stats["text_embeddings"] += 1
+                # Update checkpoint
+                if product_url not in checkpoint_data:
+                    checkpoint_data[product_url] = {}
+                checkpoint_data[product_url]["info_embedding"] = text_emb
         else:
             if existing and existing.get("info_embedding"):
                 product["info_embedding"] = existing["info_embedding"]
 
         if (i + 1) % 500 == 0:
-            logger.info(
-                "  Text embedding progress: %d/%d",
-                i + 1,
-                len(products),
-            )
+            logger.info("  Text embedding progress: %d/%d", i + 1, len(products))
+            _save_checkpoint(source, checkpoint_data)
+
+    # Final checkpoint save
+    _save_checkpoint(source, checkpoint_data)
 
     return products, stats
