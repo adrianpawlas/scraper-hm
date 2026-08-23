@@ -10,17 +10,20 @@ on:
         required: false
         default: 'false'
         type: boolean
-      category:
-        description: 'Filter to specific category (e.g., "Ladies", "Men")'
+      shards:
+        description: 'Number of parallel shards'
         required: false
+        default: '8'
         type: string
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 15
+    outputs:
+      total_products: ${{ steps.count.outputs.total }}
     concurrency:
-      group: scraper-hm
+      group: scraper-hm-scrape
       cancel-in-progress: false
 
     steps:
@@ -37,7 +40,65 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scraper
+      - name: Scrape all products
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          mkdir -p logs artifacts
+          python -c "
+          import asyncio, pickle, os, sys
+          sys.path.insert(0, '.')
+          from scraper import scrape_all_categories
+          products = asyncio.run(scrape_all_categories())
+          with open('artifacts/products.pkl', 'wb') as f:
+              pickle.dump(products, f, protocol=pickle.HIGHEST_PROTOCOL)
+          print(f'Scraped {len(products)} unique products')
+          # Write count to GITHUB_OUTPUT
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'total={len(products)}')
+          "
+
+      - name: Upload products artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: products
+          path: artifacts/products.pkl
+          retention-days: 1
+
+  embed:
+    needs: scrape
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    concurrency:
+      group: scraper-hm-embed-${{ matrix.shard }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download products artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: products
+          path: artifacts/
+
+      - name: Run scraper (shard ${{ matrix.shard }}/8)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -47,15 +108,12 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
           fi
-          if [ -n "${{ inputs.category }}" ]; then
-            ARGS="$ARGS --category ${{ inputs.category }}"
-          fi
-          python main.py $ARGS
+          python main.py $ARGS --from-file artifacts/products.pkl --shard ${{ matrix.shard }}/8
 
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: scraper-logs
+          name: logs-shard-${{ matrix.shard }}
           path: logs/
-          retention-days: 30
+          retention-days: 7

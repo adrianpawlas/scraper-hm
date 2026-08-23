@@ -39,10 +39,10 @@ logging.basicConfig(
 logger = logging.getLogger("hm_scraper")
 
 
-def _print_summary(stats: dict[str, Any], duration: float):
+def _print_summary(stats: dict[str, Any], duration: float, shard: str | None = None):
     """Print run summary."""
     print("\n" + "=" * 60)
-    print("SCRAPER RUN SUMMARY")
+    print("SCRAPER RUN SUMMARY" + (f" [SHARD {shard}]" if shard else ""))
     print("=" * 60)
     print(f"Duration: {duration:.1f}s")
     print(f"New products added: {stats.get('new', 0)}")
@@ -91,7 +91,13 @@ def _save_product_cache(products: list[dict[str, Any]], source: str, category_fi
     logger.info("Cached %d products to %s", len(products), path)
 
 
-async def run_scraper(dry_run: bool = False, category_filter: str | None = None):
+async def run_scraper(
+    dry_run: bool = False,
+    category_filter: str | None = None,
+    shard_index: int | None = None,
+    shard_total: int | None = None,
+    from_file: str | None = None,
+):
     """Main scraper execution."""
     start_time = time.time()
 
@@ -111,33 +117,52 @@ async def run_scraper(dry_run: bool = False, category_filter: str | None = None)
     logger.info(f"Source: {SOURCE}")
     logger.info(f"Dry run: {dry_run}")
 
-    # Step 1: Scrape all categories (or load from cache)
+    # Step 1: Scrape all categories (or load from cache/file)
     logger.info("=" * 40)
     logger.info("STEP 1: Scraping H&M product listings")
     logger.info("=" * 40)
 
-    # Try loading from cache first
-    all_products = _load_product_cache(SOURCE, category_filter)
+    if from_file:
+        all_products = _load_products_from_file(from_file)
+    else:
+        # Try loading from cache first
+        all_products = _load_product_cache(SOURCE, category_filter)
 
-    if all_products is None:
-        if category_filter:
-            from scraper import CATEGORIES as ALL_CATS
-            filtered = [c for c in ALL_CATS if category_filter.lower() in c["category_name"].lower()]
-            if not filtered:
-                logger.error(f"No categories match filter: {category_filter}")
+        if all_products is None:
+            if category_filter:
+                from scraper import CATEGORIES as ALL_CATS
+                filtered = [c for c in ALL_CATS if category_filter.lower() in c["category_name"].lower()]
+                if not filtered:
+                    logger.error(f"No categories match filter: {category_filter}")
+                    return
+                logger.info(f"Filtering to categories: {[c['category_name'] for c in filtered]}")
+                all_products = await scrape_all_categories(filtered)
+            else:
+                all_products = await scrape_all_categories()
+
+            if not all_products:
+                logger.error("No products scraped!")
                 return
-            logger.info(f"Filtering to categories: {[c['category_name'] for c in filtered]}")
-            all_products = await scrape_all_categories(filtered)
-        else:
-            all_products = await scrape_all_categories()
 
-        if not all_products:
-            logger.error("No products scraped!")
-            return
-
-        _save_product_cache(all_products, SOURCE, category_filter)
+            _save_product_cache(all_products, SOURCE, category_filter)
 
     logger.info(f"Total unique products scraped: {len(all_products)}")
+
+    # Apply shard filter
+    if shard_index is not None and shard_total is not None:
+        import hashlib
+        before_count = len(all_products)
+        all_products = [
+            p for p in all_products
+            if int(hashlib.md5(p.get("product_url", "").encode()).hexdigest(), 16) % shard_total == shard_index
+        ]
+        logger.info(
+            "Shard %d/%d: keeping %d of %d products",
+            shard_index, shard_total, len(all_products), before_count,
+        )
+        if not all_products:
+            logger.info("No products in this shard, done.")
+            return
 
     # Step 2: Load existing products from Supabase
     existing_map: dict[str, dict[str, Any]] = {}
@@ -242,9 +267,19 @@ async def run_scraper(dry_run: bool = False, category_filter: str | None = None)
         logger.warning(f"Errors logged to {log_path}")
 
     duration = time.time() - start_time
-    _print_summary(stats, duration)
+    shard_str = f"{shard_index}/{shard_total}" if shard_index is not None else None
+    _print_summary(stats, duration, shard=shard_str)
 
     return stats
+
+
+def _load_products_from_file(path: str) -> list[dict[str, Any]]:
+    """Load pre-scraped products from a pickle file (artifact)."""
+    logger.info("Loading products from file: %s", path)
+    with open(path, "rb") as f:
+        products = pickle.load(f)
+    logger.info("Loaded %d products from file", len(products))
+    return products
 
 
 def main():
@@ -252,15 +287,33 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Scrape without DB writes")
     parser.add_argument("--category", type=str, help="Filter to specific category")
     parser.add_argument("--fresh", action="store_true", help="Ignore product cache, re-scrape")
+    parser.add_argument("--shard", type=str, help="Shard assignment N/M (e.g., 0/8)")
+    parser.add_argument("--from-file", type=str, help="Load products from pickle file instead of scraping")
     args = parser.parse_args()
 
-    if args.fresh:
+    shard_index = None
+    shard_total = None
+    if args.shard:
+        parts = args.shard.split("/")
+        if len(parts) != 2:
+            parser.error("--shard must be in format N/M (e.g., 0/8)")
+        shard_index = int(parts[0])
+        shard_total = int(parts[1])
+        logger.info("Shard assignment: %d/%d", shard_index, shard_total)
+
+    if args.fresh and not args.from_file:
         cache_path = _product_cache_path(SOURCE, args.category)
         if os.path.exists(cache_path):
             os.remove(cache_path)
             logger.info("Removed product cache: %s", cache_path)
 
-    asyncio.run(run_scraper(dry_run=args.dry_run, category_filter=args.category))
+    asyncio.run(run_scraper(
+        dry_run=args.dry_run,
+        category_filter=args.category,
+        shard_index=shard_index,
+        shard_total=shard_total,
+        from_file=args.from_file,
+    ))
 
 
 if __name__ == "__main__":
