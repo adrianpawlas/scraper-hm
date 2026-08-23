@@ -1,6 +1,6 @@
 """Image and text embeddings using SigLIP (768-dim).
 
-Optimized with pipelined downloads, checkpoint/resume support,
+Pipelined downloads, checkpoint/resume support,
 and graceful SIGTERM handling.
 """
 import gc
@@ -13,7 +13,7 @@ import pickle
 import signal
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 import torch
@@ -27,7 +27,7 @@ from transformers import SiglipModel, SiglipTokenizer
 
 logger = logging.getLogger(__name__)
 
-# Suppress SigLIP config warnings (bos_token_id/eos_token_id out of vocab range)
+# Suppress SigLIP config warnings
 logging.getLogger("transformers.configuration_utils").setLevel(logging.ERROR)
 
 MODEL_NAME = "google/siglip-base-patch16-384"
@@ -217,7 +217,6 @@ def load_checkpoint(source: str) -> dict[str, dict[str, Any]]:
     """Load previously-embedded product data from checkpoint file."""
     path = _checkpoint_path(source)
     if not os.path.exists(path):
-        # Try legacy JSON checkpoint
         json_path = os.path.join(CHECKPOINT_DIR, f"embed_checkpoint_{source}.json")
         if os.path.exists(json_path):
             try:
@@ -261,7 +260,6 @@ def _log_memory(label: str):
     try:
         import resource
         raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # Linux: ru_maxrss is in KB; macOS: bytes
         if raw > 1_000_000:
             mb = raw / (1024 * 1024)
         else:
@@ -296,11 +294,12 @@ def embed_products(
     products: list[dict[str, Any]],
     existing_embeddings: dict[str, dict[str, Any]] | None = None,
     source: str = "scraper-hm",
+    on_batch_done: Callable[[list[dict[str, Any]], int], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Generate embeddings with pipelined downloads and checkpoint/resume.
 
-    Loads checkpoint from previous run to skip already-embedded products.
-    Saves checkpoint after each batch so progress survives kills/restarts.
+    on_batch_done: callback called after each batch with (products, batch_num).
+                   Use this to upsert to DB incrementally.
     """
     if existing_embeddings is None:
         existing_embeddings = {}
@@ -312,7 +311,6 @@ def embed_products(
         "skipped": 0,
     }
 
-    # Merge checkpoint into existing_embeddings so we skip already-done products
     checkpoint = load_checkpoint(source)
     for url, ckpt_data in checkpoint.items():
         if url not in existing_embeddings:
@@ -322,7 +320,6 @@ def embed_products(
     _log_memory("after model load")
     _setup_signal_handlers(source)
 
-    # Build list of images needing embedding
     all_needed: list[tuple[int, str, str]] = []
     for i, product in enumerate(products):
         product_url = product.get("product_url", "")
@@ -341,7 +338,6 @@ def embed_products(
     logger.info("Need to embed %d images total", len(all_needed))
     _log_memory("before embedding loop")
 
-    # Also carry forward existing image/text embeddings for products not needing re-embed
     for i, product in enumerate(products):
         product_url = product.get("product_url", "")
         existing = existing_embeddings.get(product_url, {})
@@ -355,11 +351,9 @@ def embed_products(
             if existing.get("embedding_version"):
                 product["embedding_version"] = existing["embedding_version"]
 
-    # Track embedded URLs for checkpointing (lightweight in-memory set)
     global _checkpoint_data
     checkpoint_data: dict[str, dict[str, Any]] = dict(checkpoint)
     _checkpoint_data = checkpoint_data
-    # Also track just URLs to avoid keeping all embeddings in memory
     completed_urls: set[str] = set(checkpoint.keys())
 
     if not all_needed:
@@ -368,12 +362,10 @@ def embed_products(
         total_batches = math.ceil(len(all_needed) / BATCH_DOWNLOAD)
         downloaded_urls: set[str] = set()
 
-        # Pre-split into download batches
         download_batches: list[list[tuple[int, str, str]]] = []
         for batch_start in range(0, len(all_needed), BATCH_DOWNLOAD):
             download_batches.append(all_needed[batch_start : batch_start + BATCH_DOWNLOAD])
 
-        # Pipeline: download next batch while embedding current
         pending_download: dict[str, Optional[Image.Image]] = {}
         download_executor = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
         next_download_future = None
@@ -388,7 +380,6 @@ def embed_products(
             next_download_future = _start_download(download_batches[0])
 
         for batch_num, batch in enumerate(download_batches, 1):
-            # Wait for current download
             if next_download_future is not None:
                 logger.info("  Batch %d/%d: waiting for downloads...", batch_num, total_batches)
                 try:
@@ -397,13 +388,11 @@ def embed_products(
                     logger.error("Download batch failed: %s", e)
                     pending_download = {}
 
-            # Start next download in parallel
             if batch_num < len(download_batches):
                 next_download_future = _start_download(download_batches[batch_num])
             else:
                 next_download_future = None
 
-            # Collect images for batched inference
             images_to_embed: list[tuple[int, str, str, Image.Image]] = []
             for idx, url, view_type in batch:
                 product = products[idx]
@@ -429,7 +418,6 @@ def embed_products(
                     elif not back_url:
                         product["back_image_embedding"] = None
 
-            # Batched inference
             for infer_start in range(0, len(images_to_embed), INFERENCE_BATCH_SIZE):
                 infer_batch = images_to_embed[infer_start : infer_start + INFERENCE_BATCH_SIZE]
                 pil_images = [img for _, _, _, img in infer_batch]
@@ -446,7 +434,6 @@ def embed_products(
                         else:
                             product["back_image_embedding"] = embedding
                             stats["back_embeddings"] += 1
-                        # Update checkpoint data
                         if purl not in checkpoint_data:
                             checkpoint_data[purl] = {}
                         if view_type == "front":
@@ -463,10 +450,8 @@ def embed_products(
             pending_download.clear()
             gc.collect()
 
-            # Save checkpoint to disk, then clear in-memory data to save RAM
             _save_checkpoint(source, checkpoint_data)
             completed_urls.update(checkpoint_data.keys())
-            checkpoint_data.clear()
 
             _log_memory("batch %d/%d" % (batch_num, total_batches))
             logger.info(
@@ -478,13 +463,21 @@ def embed_products(
                 len(completed_urls),
             )
 
+            # Callback: upsert this batch to DB immediately
+            if on_batch_done:
+                batch_product_indices = set(idx for idx, _, _ in batch)
+                batch_products = [products[idx] for idx in sorted(batch_product_indices)]
+                try:
+                    on_batch_done(batch_products, batch_num)
+                except Exception as e:
+                    logger.error("Batch upsert callback failed: %s", e)
+
         download_executor.shutdown(wait=False)
 
-    # Reload checkpoint from disk (contains all image embeddings we just saved)
+    # Text embeddings
     checkpoint_data = load_checkpoint(source)
     _checkpoint_data = checkpoint_data
 
-    # Text embeddings
     logger.info("  Generating text embeddings for %d products...", len(products))
     for i, product in enumerate(products):
         product_url = product.get("product_url", "")
@@ -512,7 +505,6 @@ def embed_products(
             if text_emb:
                 product["info_embedding"] = text_emb
                 stats["text_embeddings"] += 1
-                # Update checkpoint
                 if product_url not in checkpoint_data:
                     checkpoint_data[product_url] = {}
                 checkpoint_data[product_url]["info_embedding"] = text_emb
@@ -524,7 +516,6 @@ def embed_products(
             logger.info("  Text embedding progress: %d/%d", i + 1, len(products))
             _save_checkpoint(source, checkpoint_data)
 
-    # Final checkpoint save
     _save_checkpoint(source, checkpoint_data)
     _checkpoint_data.clear()
 

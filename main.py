@@ -142,6 +142,7 @@ async def run_scraper(dry_run: bool = False, category_filter: str | None = None)
     # Step 2: Load existing products from Supabase
     existing_map: dict[str, dict[str, Any]] = {}
     seen_urls: set[str] = set()
+    sb = None
 
     if not dry_run:
         logger.info("=" * 40)
@@ -165,24 +166,53 @@ async def run_scraper(dry_run: bool = False, category_filter: str | None = None)
     logger.info(f"Existing products in DB: {len(existing_map)}")
     logger.info(f"Products to process: {len(all_products)}")
 
-    # Step 3: Generate embeddings
+    # Step 3: Generate embeddings + upsert incrementally
     logger.info("=" * 40)
-    logger.info("STEP 3: Generating embeddings")
+    logger.info("STEP 3: Generating embeddings (upserting after each batch)")
     logger.info("=" * 40)
 
-    all_products, embed_stats = embed_products(all_products, existing_map, source=SOURCE)
+    upsert_stats = {"new": 0, "updated": 0, "unchanged": 0, "errors": 0}
+
+    def _on_batch_done(batch_products: list[dict[str, Any]], batch_num: int):
+        """Upsert a batch of products to DB immediately after embedding."""
+        if dry_run or sb is None:
+            return
+
+        async def _upsert():
+            async with httpx.AsyncClient() as client:
+                batch_stats = await sb.upsert_batch(client, batch_products)
+                upsert_stats["new"] += batch_stats["new"]
+                upsert_stats["updated"] += batch_stats["updated"]
+                upsert_stats["unchanged"] += batch_stats["unchanged"]
+                upsert_stats["errors"] += batch_stats["errors"]
+                logger.info(
+                    "  DB upsert batch %d: +%d new, ~%d updated, =%d unchanged",
+                    batch_num, batch_stats["new"], batch_stats["updated"], batch_stats["unchanged"],
+                )
+
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(asyncio.run, _upsert()).result()
+
+    all_products, embed_stats = embed_products(
+        all_products, existing_map, source=SOURCE, on_batch_done=_on_batch_done,
+    )
     stats["front_embeddings"] = embed_stats["front_embeddings"]
     stats["back_embeddings"] = embed_stats["back_embeddings"]
     stats["text_embeddings"] = embed_stats["text_embeddings"]
+    stats["new"] = upsert_stats["new"]
+    stats["updated"] = upsert_stats["updated"]
+    stats["unchanged"] = upsert_stats["unchanged"]
+    stats["errors"] = upsert_stats["errors"]
 
-    # Step 4: Upsert to Supabase
+    # Step 4: Cleanup stale products + final upsert for text embeddings
     if not dry_run:
-        logger.info("=" * 40)
-        logger.info("STEP 4: Upserting to Supabase")
-        logger.info("=" * 40)
-
         async with httpx.AsyncClient() as client:
-            # Process in batches
+            # Final upsert to catch any text embeddings added after last batch
+            logger.info("=" * 40)
+            logger.info("STEP 4: Final upsert + stale cleanup")
+            logger.info("=" * 40)
+
             for i in range(0, len(all_products), BATCH_SIZE):
                 batch = all_products[i : i + BATCH_SIZE]
                 batch_stats = await sb.upsert_batch(client, batch)
@@ -191,22 +221,12 @@ async def run_scraper(dry_run: bool = False, category_filter: str | None = None)
                 stats["unchanged"] += batch_stats["unchanged"]
                 stats["errors"] += batch_stats["errors"]
 
-                if (i + BATCH_SIZE) % (BATCH_SIZE * 5) == 0:
-                    logger.info(
-                        f"  Upsert progress: {min(i + BATCH_SIZE, len(all_products))}/{len(all_products)}"
-                    )
-
-            # Step 5: Stale product cleanup
-            logger.info("=" * 40)
             logger.info("STEP 5: Cleaning up stale products")
-            logger.info("=" * 40)
             stats["stale_deleted"] = await sb.cleanup_stale_products(client, seen_urls)
 
-            # Clear checkpoint after successful DB upsert
             clear_checkpoint(SOURCE)
     else:
         logger.info("DRY RUN - Skipping DB upsert and cleanup")
-        # Count what would happen
         for product in all_products:
             if product["product_url"] not in existing_map:
                 stats["new"] += 1
