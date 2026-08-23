@@ -1,11 +1,12 @@
 """Image and text embeddings using SigLIP (768-dim).
 
-Optimized with batched model inference and concurrent image downloads.
+Optimized with pipelined downloads, batched inference, and thread control.
 """
 import io
 import json
 import logging
 import math
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
@@ -23,8 +24,8 @@ logger = logging.getLogger(__name__)
 
 MODEL_NAME = "google/siglip-base-patch16-384"
 EMBEDDING_DIM = 768
-DOWNLOAD_WORKERS = 16
-INFERENCE_BATCH_SIZE = 32  # images per forward pass
+DOWNLOAD_WORKERS = 20
+INFERENCE_BATCH_SIZE = 64
 
 _model = None
 _image_processor = None
@@ -48,7 +49,9 @@ def _get_device():
 def _load_model():
     global _model, _image_processor, _tokenizer
     if _model is None:
-        logger.info("Loading SigLIP model %s...", MODEL_NAME)
+        num_cpus = os.cpu_count() or 2
+        torch.set_num_threads(num_cpus)
+        logger.info("Loading SigLIP model %s (threads=%d)...", MODEL_NAME, num_cpus)
         _image_processor = SiglipImageProcessor.from_pretrained(MODEL_NAME)
         _tokenizer = SiglipTokenizer.from_pretrained(MODEL_NAME)
         _model = SiglipModel.from_pretrained(MODEL_NAME)
@@ -71,14 +74,14 @@ def _download_image(image_url: str) -> Optional[Image.Image]:
 
 
 def _embed_images_batch(images: list[Image.Image]) -> list[Optional[list[float]]]:
-    """Embed a batch of images through SigLIP vision encoder at once."""
+    """Embed a batch of images through SigLIP vision encoder."""
     model, image_processor, _ = _load_model()
     device = _get_device()
-    results = [None] * len(images)
+    results: list[Optional[list[float]]] = [None] * len(images)
     try:
         inputs = image_processor(images=images, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model.get_image_features(**inputs)
         if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
             emb_tensor = outputs.pooler_output
@@ -86,12 +89,10 @@ def _embed_images_batch(images: list[Image.Image]) -> list[Optional[list[float]]
             emb_tensor = outputs.last_hidden_state[:, 0, :]
         else:
             emb_tensor = outputs
-        # Convert to list of individual embeddings
         for i in range(emb_tensor.shape[0]):
             results[i] = emb_tensor[i].cpu().float().numpy().flatten().tolist()
     except Exception as e:
         logger.warning("Batch embed failed (size %d): %s", len(images), e)
-        # Fallback: try one-by-one
         for i, img in enumerate(images):
             try:
                 results[i] = _embed_single(img)
@@ -101,13 +102,12 @@ def _embed_images_batch(images: list[Image.Image]) -> list[Optional[list[float]]
 
 
 def _embed_single(image: Image.Image) -> Optional[list[float]]:
-    """Embed a single image (fallback)."""
     model, image_processor, _ = _load_model()
     device = _get_device()
     try:
         inputs = image_processor(images=image, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model.get_image_features(**inputs)
         if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
             emb_tensor = outputs.pooler_output
@@ -135,7 +135,7 @@ def get_text_embedding(text: str) -> Optional[list[float]]:
             max_length=64,
         )
         inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model.get_text_features(**inputs)
         if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
             emb_tensor = outputs.pooler_output
@@ -192,7 +192,10 @@ def embed_products(
     products: list[dict[str, Any]],
     existing_embeddings: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Generate embeddings for products using batched SigLIP inference."""
+    """Generate embeddings with pipelined downloads and batched inference.
+
+    Pipeline: download batch N+1 while embedding batch N.
+    """
     if existing_embeddings is None:
         existing_embeddings = {}
 
@@ -225,30 +228,46 @@ def embed_products(
 
     logger.info("Need to embed %d images total", len(all_needed))
 
-    # Process in download batches
-    downloaded_urls: set[str] = set()
-    downloaded_images: dict[str, Image.Image] = {}
-
     total_batches = math.ceil(len(all_needed) / BATCH_DOWNLOAD) if all_needed else 0
+    downloaded_urls: set[str] = set()
 
-    for batch_num, batch_start in enumerate(range(0, len(all_needed), BATCH_DOWNLOAD), 1):
-        batch = all_needed[batch_start : batch_start + BATCH_DOWNLOAD]
-        batch_urls = list(set(url for _, url, _ in batch if url not in downloaded_urls))
+    # Pre-split all_needed into download batches
+    download_batches: list[list[tuple[int, str, str]]] = []
+    for batch_start in range(0, len(all_needed), BATCH_DOWNLOAD):
+        download_batches.append(all_needed[batch_start : batch_start + BATCH_DOWNLOAD])
 
-        if batch_urls:
-            logger.info(
-                "  Batch %d/%d: downloading %d images...",
-                batch_num,
-                total_batches,
-                len(batch_urls),
-            )
-            batch_images = _download_batch(batch_urls)
-            downloaded_images.update(batch_images)
-            downloaded_urls.update(batch_urls)
-            succeeded = sum(1 for v in batch_images.values() if v is not None)
-            logger.info("  Downloaded %d/%d", succeeded, len(batch_urls))
+    # Pipeline: download next batch while embedding current
+    pending_download: dict[str, Optional[Image.Image]] = {}
+    download_executor = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
+    next_download_future = None
 
-        # Collect images for batched inference
+    def _start_download(batch: list[tuple[int, str, str]]):
+        urls = list(set(url for _, url, _ in batch if url not in downloaded_urls))
+        if not urls:
+            return None
+        return download_executor.submit(_download_batch, urls)
+
+    # Start first download
+    if download_batches:
+        next_download_future = _start_download(download_batches[0])
+
+    for batch_num, batch in enumerate(download_batches, 1):
+        # Wait for current download to finish
+        if next_download_future is not None:
+            logger.info("  Batch %d/%d: waiting for downloads...", batch_num, total_batches)
+            try:
+                pending_download = next_download_future.result()
+            except Exception as e:
+                logger.error("Download batch failed: %s", e)
+                pending_download = {}
+
+        # Kick off next download in parallel
+        if batch_num < len(download_batches):
+            next_download_future = _start_download(download_batches[batch_num])
+        else:
+            next_download_future = None
+
+        # Process embeddings for current batch
         images_to_embed: list[tuple[int, str, str, Image.Image]] = []
         for idx, url, view_type in batch:
             product = products[idx]
@@ -259,7 +278,7 @@ def embed_products(
                 image_url = product.get("image_url", "")
                 existing_image_url = existing.get("image_url", "")
                 if image_url and (not existing or image_url != existing_image_url):
-                    image = downloaded_images.get(image_url)
+                    image = pending_download.get(image_url)
                     if image:
                         images_to_embed.append((idx, image_url, "front", image))
                     else:
@@ -272,7 +291,7 @@ def embed_products(
                 back_url = product.get("back_image_url")
                 existing_back_url = existing.get("back_image_url")
                 if back_url and (not existing or back_url != existing_back_url):
-                    image = downloaded_images.get(back_url)
+                    image = pending_download.get(back_url)
                     if image:
                         images_to_embed.append((idx, back_url, "back", image))
                 elif not back_url:
@@ -298,17 +317,17 @@ def embed_products(
                 else:
                     stats["skipped"] += 1
 
-        # Free memory
-        for url in batch_urls:
-            downloaded_images.pop(url, None)
+        downloaded_urls.update(url for _, url, _ in batch)
+        pending_download.clear()
 
         logger.info(
-            "  Batch %d done. Totals: front=%d, back=%d, text=%d",
+            "  Batch %d done. Totals: front=%d, back=%d",
             batch_num,
             stats["front_embeddings"],
             stats["back_embeddings"],
-            stats["text_embeddings"],
         )
+
+    download_executor.shutdown(wait=False)
 
     # Text embeddings for all products
     logger.info("  Generating text embeddings for %d products...", len(products))
@@ -316,7 +335,6 @@ def embed_products(
         product_url = product.get("product_url", "")
         existing = existing_embeddings.get(product_url, {})
 
-        # Carry forward existing image embeddings
         image_url = product.get("image_url", "")
         existing_image_url = existing.get("image_url", "")
         if not (image_url and (not existing or image_url != existing_image_url)):
@@ -329,7 +347,6 @@ def embed_products(
             if existing and existing.get("back_image_embedding"):
                 product["back_image_embedding"] = existing["back_image_embedding"]
 
-        # Info embedding
         info_text = _build_info_text(product)
         existing_info_text = ""
         if existing:
