@@ -348,8 +348,6 @@ def embed_products(
                 product["back_image_embedding"] = existing["back_image_embedding"]
             if existing.get("info_embedding") and not product.get("info_embedding"):
                 product["info_embedding"] = existing["info_embedding"]
-            if existing.get("embedding_version"):
-                product["embedding_version"] = existing["embedding_version"]
 
     global _checkpoint_data
     checkpoint_data: dict[str, dict[str, Any]] = dict(checkpoint)
@@ -429,7 +427,6 @@ def embed_products(
                     if embedding:
                         if view_type == "front":
                             product["image_embedding"] = embedding
-                            product["embedding_version"] = 2
                             stats["front_embeddings"] += 1
                         else:
                             product["back_image_embedding"] = embedding
@@ -438,7 +435,6 @@ def embed_products(
                             checkpoint_data[purl] = {}
                         if view_type == "front":
                             checkpoint_data[purl]["image_embedding"] = embedding
-                            checkpoint_data[purl]["embedding_version"] = 2
                             checkpoint_data[purl]["image_url"] = product.get("image_url", "")
                         else:
                             checkpoint_data[purl]["back_image_embedding"] = embedding

@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from config import BATCH_SIZE, EMBEDDING_VERSION, SOURCE, STALE_MISS_THRESHOLD
+from config import BATCH_SIZE, SOURCE, STALE_MISS_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +24,7 @@ UPSERT_COLUMNS = [
     "compressed_image_url", "back_image_url", "brand", "title",
     "description", "category", "gender", "price", "sale", "metadata",
     "size", "second_hand", "country", "tags", "additional_images",
-    "other", "image_embedding", "back_image_embedding",
-    "embedding_version", "info_embedding",
+    "other", "image_embedding", "back_image_embedding", "info_embedding",
 ]
 
 # Fields to compare for change detection (excluding embeddings and metadata)
@@ -215,10 +214,6 @@ class SupabaseClient:
                     pass  # embedding already set by embed_products
                 else:
                     row["info_embedding"] = _to_pgvector(existing.get("info_embedding"))
-
-                # Set embedding_version if any embedding was written
-                if row.get("image_embedding") and row["image_embedding"] != _to_pgvector(existing.get("image_embedding")):
-                    row["embedding_version"] = EMBEDDING_VERSION
 
                 rows_to_upsert.append(row)
                 stats["updated"] += 1
